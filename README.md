@@ -1,6 +1,14 @@
-# hakios-metal
+# metal
 
-This is part of the kernel's tree: `make ios` here, and `userland/build.sh` links what it builds.
+AkIOS's Metal core: Metal's command model over the phone's GPU (the Mali-G715 of the Pixel 8a through the kernel's
+IOGPU service, compiled by our AIR front end and Mesa's Panfrost back end), and the old CoreAnimation plug-in
+(ca-plugin/) until the AkiosMetal plug-in replaces it. Built by `ak userland` of the AkIOS umbrella repository, which
+checks this out at metal/ (the Makefile takes the toolchain and Mesa from the tree around it).
+
+**History.** The base is [hakios-metal](https://github.com/oosexgang/hakios-metal) up to 5974ea9 (2026-11-03), its
+commits as they are; AkIOS's work is on top (the Mali back end, IOGPU, the external mode for AkiosMetal). hakios-metal's
+later commits (the window server's Metal on Vulkan for its Adreno phone, then its move into the kernel repository)
+were not taken. The text below is partly hakios-metal's own, from the Adreno days.
 
 The Metal driver of [hakios](https://github.com/oosexgang/hakios-xnu-kernel), in C++: Metal's command model on the phone's
 Adreno GPU (an Adreno 7c+ Gen 3, chip id 0x06030500), through the kernel's own GPU driver (HakiosGPU), without Mesa
