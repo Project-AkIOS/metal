@@ -27,10 +27,11 @@ HOSTOUT   = out/host$(if $(SAN),-$(SAN))
 # host build with hakios's AIR front end in it) and compiler_test compares it with the fixture; without MESA=1 the
 # tests build on any C++17 and compileAir() is a refusal by name. Included here, before the rules, so that HOSTOUT and
 # the flags are settled when the rules are read.
-# the hakios tree (HAKIOS=), named before the fragments: compiler.mk reads the iOS Mesa build's -D set from
-# $(HAKIOS)/xnu-deps/build/mesa at parse time, which an unset HAKIOS would turn into a silent empty set
-# (in the kernel's tree, hakios-metal/: that tree; beside it, HAKIOS= or the workspace of old)
-HAKIOS    ?= $(if $(wildcard ../xnu/apply.sh),..,../workspace)
+# the akios tree around this one (named before the fragments, which read it at parse time): its toolchain
+# (.cache/toolchain, `ak toolchain`) and the iOS/host builds of Mesa 26 (.cache/mesa26, tools/mesa/pan/mk-pan-*.sh)
+AKIOS     ?= $(abspath ..)
+TOOLCHAIN ?= $(AKIOS)/.cache/toolchain
+MESA26    ?= $(AKIOS)/.cache/mesa26
 -include tools/kernels.mk
 -include tools/compiler.mk
 ifneq ($(strip $(MESA)),)
@@ -39,7 +40,7 @@ HOSTLIBS  += $(HAKIOS_METAL_MESA_LIBS)
 HOSTOUT   = out/host-mesa$(if $(SAN),-$(SAN))
 endif
 # the SDK as hakios lays it out: theos, or on macOS xnu-deps/theos-mac
-SDK       ?= $(abspath $(firstword $(wildcard $(THEOS)/sdks/iPhoneOS16.5.sdk $(HAKIOS)/xnu-deps/theos-mac/sdks/iPhoneOS16.5.sdk $(HOME)/theos/sdks/iPhoneOS16.5.sdk)))
+SDK       ?= $(abspath $(firstword $(wildcard $(THEOS)/sdks/iPhoneOS16.5.sdk $(HOME)/theos/sdks/iPhoneOS16.5.sdk)))
 # ARCH: the userland's architecture, as userland/build.sh has it from the unpacked build's build.conf: arm64e (the
 # iPhone 13 mini's, d16ap, and the newer iOS releases': the default since 11-20; an arm64 library does not load into
 # its processes) or arm64 (the iPhone X's, d22ap). The Mali build of another architecture than arm64 goes beside it, out/ios-mali-$(ARCH), over Mesa's
@@ -56,7 +57,7 @@ else
 # On Linux the cross compiler is hakios's wrapper around clang and the cctools linker (xnu-deps/host/bin, laid out by
 # xnu-deps/setup.sh), and the archive must be in the form Apple's ld reads: with GNU ar's symbol table the probe failed
 # to link against every symbol of the library.
-IOS_CXX   ?= $(abspath $(HAKIOS))/xnu-deps/host/bin/xnu-clang++ -arch $(ARCH) -isysroot $(SDK) -miphoneos-version-min=16.0
+IOS_CXX   ?= $(TOOLCHAIN)/host/bin/xnu-clang++ -arch $(ARCH) -isysroot $(SDK) -miphoneos-version-min=16.0
 IOS_AR    ?= llvm-ar --format=darwin rcs
 endif
 
@@ -102,13 +103,13 @@ ios: out/ios/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),out/ios/hakios-
 # plug-in uses today, by the Mali (src/mali/mali_*.cpp; its blit shaders from hakios-kernel's tools/mesa/pan)
 # Its compiler (src/mali/compile_mali.c: AIR -> NIR -> Mesa 26.2.5's panfrost) is built with the flags of Mesa's iOS build
 # and Mesa's archives go into the library with it, all written by hakios-kernel's tools/mesa/pan/mk-pan-ios.sh into
-# MALI_MESA (HAKIOS= that tree: make ios-mali HAKIOS=../hakios-base). The plug-in that links the library adds -lz.
+# MALI_MESA ($(MESA26): tools/mesa/pan/mk-pan-ios.sh). The plug-in that links the library adds -lz.
 MALI_OUT      = out/ios-mali$(ARCHSFX)
 ios-mali: $(MALI_OUT)/libhakios-metal.a
 
-MALI_MESA    ?= $(HAKIOS)/xnu-deps/build/mesa26/out-ios$(ARCHSFX)
+MALI_MESA    ?= $(MESA26)/out-ios$(ARCHSFX)
 IOS_CC       ?= $(patsubst %clang++,%clang,$(firstword $(IOS_CXX))) $(wordlist 2,99,$(IOS_CXX))
-IOS_LIBTOOL  ?= $(if $(filter Darwin,$(shell uname)),xcrun libtool,$(abspath $(HAKIOS))/xnu-deps/host/bin/libtool)
+IOS_LIBTOOL  ?= $(if $(filter Darwin,$(shell uname)),xcrun libtool,$(TOOLCHAIN)/host/bin/libtool)
 
 # the compiled-program cache's key on the phone (mali_programs.cpp: cacheKey), as IOS_CACHE_BUILD below for the Adreno: what
 # the compiler is made of -- compile_mali.c/.h, Mesa's flags and archives (the AIR front end among them) -- not the

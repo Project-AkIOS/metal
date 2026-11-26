@@ -1,0 +1,150 @@
+#!/bin/bash
+# Mesa 26.2.6's panfrost compiler cross-built for the phone (arm64 iOS 16.5): the libraries the Metal driver's Mali
+# back end links, to compile shaders on the Pixel 8a itself for its Mali-G715 -- what tools/mk-mesa.sh does with 25.0.7
+# for redwood's Adreno, with the same cross compiler (xnu-deps/host/bin/xnu-clang) and SDK. Only the compiler's
+# archives are built (NIR, the compiler's glue, panfrost's compiler, util); the configuration is mk-pan-host.sh's.
+#
+#   tools/mesa/pan/mk-pan-ios.sh       -> xnu-deps/build/mesa26/build-ios/...  (archives listed in out-ios/archives)
+set -e
+# ARCH=arm64e (the default since 11-20: the iPhone 13 mini's userland, d16ap, and the newer iOS releases'; an arm64
+# library does not load into an arm64e process) or arm64 (the iPhone X's, d22ap). arm64 builds where it always did; another architecture beside it, its name on the
+# cross file and on the build and output directories, so that neither build takes the other's objects.
+ARCH=${ARCH:-arm64e}
+case $ARCH in arm64) SFX= ;; arm64e) SFX=-arm64e ;; *) echo "$0: ARCH=$ARCH: arm64 or arm64e" >&2; exit 1 ;; esac
+VERSION=${MESA_VERSION:-26.2.6}
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)
+# akios's toolchain (.cache/toolchain, `ak toolchain`), as ak kernel sets it up
+T=$(cd "$ROOT/.." && pwd)/.cache/toolchain
+export XNU_HOST_OS=$(uname) THEOS=${THEOS:-$HOME/theos} XNUDEPS=$T PATH=$T/host/bin:$PATH XNU_SDK_VERSION=16.5 \
+	XNU_SDK_PATH=$T/sdk/iPhoneOS16.5.xnu.sdk XNU_PLATFORM_PATH=$T/sdk/Platforms/iPhoneOS.platform
+AKIOS=$(cd "$ROOT/.." && pwd)
+B=$AKIOS/.cache/mesa26
+SDK=$THEOS/sdks/iPhoneOS16.5.sdk
+CC=$T/host/bin/xnu-clang
+BUILD=build-ios$SFX
+OUT=out-ios$SFX
+CROSS=cross-ios$SFX.ini
+mkdir -p "$B/$OUT"
+cd "$B"
+[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
+[ -d mesa-$VERSION ] || tar xJf mesa-$VERSION.tar.xz
+# panfrost's OpenCL precompiler (src/panfrost/clc) runs a host program against panfrost's own libraries, which a cross
+# build cannot have: it is for the drivers (libpan's kernels), not the compiler, so only the drivers take it in
+python3 - mesa-$VERSION/src/panfrost/meson.build <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace("if with_gallium_panfrost or with_panfrost_vk or with_tools.contains('panfrost')\n  subdir('clc')",
+              "if with_gallium_panfrost or with_panfrost_vk\n  subdir('clc')")
+open(p, 'w').write(s)
+PY
+# THE REGISTER ALLOCATOR'S PRE-SPILL (11-23): bi_register_allocate spills a shader whose estimated demand is over the
+# register file down to exactly the file's size; the estimate comes before the out-of-SSA and vector lowering, so a big
+# shader (backboardd's compositor uber shaders, once their inline samplers compiled) still did not fit, and the fallback
+# -- a whole allocation, then ONE value spilled, up to 2000 times -- ran for minutes: backboardd never answered SpringBoard
+# (BKSDisplayServicesStart). Such a shader is spilled to 16 registers fewer, so the first allocation fits; one that fits
+# the file is not touched.
+python3 - mesa-$VERSION/src/panfrost/compiler/bifrost/bi_ra.c <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "         bi_spill_ssa(ctx, regs_to_use);\n"
+new = "         bi_spill_ssa(ctx, regs_to_use > 32 ? regs_to_use - 16 : regs_to_use);   /* (AkIOS: a margin) */\n"
+if new not in s:
+    assert s.count(old) == 1, "bi_ra.c: the pre-spill call changed"
+    s = s.replace(old, new)
+open(p, 'w').write(s)
+PY
+# LOOP BLOCKS TO A FIXED POINT (11-23): find_all_dominated_predecessors always ran num_blocks - 1 rounds over every block,
+# changed or not -- quadratic in the blocks, and the SSA spiller asks it for every loop header: backboardd's compositor
+# shaders kept bi_spill_ssa busy for minutes. It stops at the first round that sets nothing (the same result).
+python3 - mesa-$VERSION/src/panfrost/compiler/bifrost/bifrost_compile.c <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """   for (uint32_t iter = 0; iter < ctx->num_blocks - 1; ++iter) {
+      bi_foreach_block(ctx, block) {
+         bi_foreach_successor(block, succ) {
+            if ((succ == b || BITSET_TEST(out, succ->index)) &&
+                BITSET_TEST(dominators, block->index)) {
+               BITSET_SET(out, block->index);
+               break;
+            }
+         }
+      }
+   }"""
+new = """   for (uint32_t iter = 0; iter < ctx->num_blocks - 1; ++iter) {
+      bool progress = false;   /* (AkIOS: stop at the fixed point) */
+      bi_foreach_block(ctx, block) {
+         bi_foreach_successor(block, succ) {
+            if ((succ == b || BITSET_TEST(out, succ->index)) &&
+                BITSET_TEST(dominators, block->index)) {
+               if (!BITSET_TEST(out, block->index)) {
+                  BITSET_SET(out, block->index);
+                  progress = true;
+               }
+               break;
+            }
+         }
+      }
+      if (!progress)
+         break;
+   }"""
+if "AkIOS: stop at the fixed point" not in s:
+    assert s.count(old) == 1, "bifrost_compile.c: find_all_dominated_predecessors changed"
+    s = s.replace(old, new)
+open(p, 'w').write(s)
+PY
+# our AIR front end (tools/mesa/air), as mk-pan-host.sh puts it there
+rm -rf mesa-$VERSION/src/compiler/air
+# tools/mesa/air-mesa26: the front end the Mali build links (Mesa 26 names); tools/mesa/air, merged from upstream, still has
+# Mesa 25 names and does not build here. AIR_SRC= for another.
+cp -r "${AIR_SRC:-$ROOT/tools/mesa/air-mesa26}" mesa-$VERSION/src/compiler/air
+grep -q "subdir('air')" mesa-$VERSION/src/compiler/meson.build || patch -s -d mesa-$VERSION -p1 < "$ROOT/tools/mesa/air-frontend.patch"
+cat > $CROSS <<INI
+[binaries]
+c = ['$CC', '-arch', '$ARCH', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+cpp = ['$CC++', '-arch', '$ARCH', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '-fuse-cxa-atexit']
+objc = ['$CC', '-arch', '$ARCH', '-isysroot', '$SDK']
+ar = 'llvm-ar'
+ranlib = 'llvm-ranlib'
+strip = 'llvm-strip'
+pkg-config = 'false'
+
+[host_machine]
+system = 'darwin'
+subsystem = 'ios'
+cpu_family = 'aarch64'
+cpu = 'arm64'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+INI
+[ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file $CROSS --wrap-mode=nofallback \
+	--buildtype=release -Db_ndebug=true -Dplatforms= -Dgallium-drivers=softpipe -Dvulkan-drivers= -Dglx=disabled \
+	-Degl=disabled -Dgbm=disabled -Dllvm=disabled -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dzstd=disabled \
+	-Dexpat=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dlmsensors=disabled \
+	-Dbuild-tests=false -Dshader-cache=disabled -Dxmlconfig=disabled -Dtools=panfrost > meson-ios$SFX.log
+LIBS="src/compiler/air/libair.a src/panfrost/compiler/libpanfrost_compiler.a src/panfrost/compiler/bifrost/libpanfrost_bifrost.a
+src/panfrost/compiler/bifrost/libpanfrost_bifrost_disasm.a src/panfrost/compiler/bifrost/valhall/libpanfrost_valhall_disasm.a
+src/panfrost/compiler/midgard/libpanfrost_midgard.a src/panfrost/compiler/midgard/libpanfrost_midgard_disasm.a
+src/panfrost/model/libpanfrost_model_lib.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a
+src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a"
+ninja -C $BUILD $LIBS > ninja-ios$SFX.log
+for l in $LIBS; do echo "$B/$BUILD/$l"; done > $OUT/archives
+echo "mk-pan-ios.sh: $(wc -l < $OUT/archives) archives for $ARCH iOS in $B/$BUILD"
+# the flags Mesa's iOS build compiles its compiler with (defines, include paths), for a C file that calls it from
+# outside the build -- hakios-metal's src/mali/compile_mali.c (its Makefile reads out-ios/cflags and out-ios/archives)
+(cd $BUILD && python3 - <<'PY'
+import json, shlex
+for e in json.load(open('compile_commands.json')):
+    if e['file'].endswith('compiler/pan_compiler.c'):
+        a, out, skip = shlex.split(e['command']), [], False
+        for x in a[1:]:
+            if skip: skip = False; continue
+            if x in ('-o', '-MF', '-MQ'): skip = True; continue
+            if x == '-c' or x.endswith('.c') or x.startswith('-M'): continue
+            if x.startswith('-I') and not x.startswith('-I/'): x = '-I' + __import__('os').path.abspath(x[2:])
+            out.append(x)
+        print(' '.join(shlex.quote(x) for x in out)); break
+PY
+) > $OUT/cflags
+echo "mk-pan-ios.sh: flags in $B/$OUT/cflags"
